@@ -1,125 +1,125 @@
-using CAT.App.D365.Service.Core;
-using CAT.App.D365.Service.Core.Utilities;
+using CAT.App.D365.Service.Core.Models;
 using CAT.App.D365.Service.Core.Utilities.Interface;
 using CAT.App.D365.Service.Infra.Service;
 using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Reflection.Metadata;
 using System.Text;
 using System.Threading.Tasks;
+using CAT.App.D365.Service.Core;
+using Newtonsoft.Json;
+using DotLiquid;
 
 namespace CAT.App.D365.Service.Application.Service
 {
-    public class CompanyApplication : ICompanyApplication
+    public class CustomerApplication : ICustomerApplication
     {
-        private readonly ICompanyService _service;
-        private readonly IPeriodService _periodService;
+        private readonly ICustomerService _service;
         private readonly ILiquidTemplateService _liquidTemplateService;
 
-        public CompanyApplication(ICompanyService service, IPeriodService periodService, ILiquidTemplateService liquidTemplateService)
+        public CustomerApplication(ICustomerService service, ILiquidTemplateService liquidTemplateService)
         {
-            _service = service;
-            _periodService = periodService;
             _liquidTemplateService = liquidTemplateService;
+            _service = service;
         }
 
-        public async Task<string> CreateCompanyAsync(string companyInfo)
+        public async Task<string> CreateCustomerAsync(string customerInfo)
         {
-            var payload = await _liquidTemplateService.GetLiquidTemplateAsync(companyInfo, LiquidTemplateConstants.CREATE_COMPANY_RECORD_TEMPLATE);
-
-            var response = await _service.CreateCompanyAsync(payload);
-            return response.ToString();
-        }
-
-        public async Task<string> GetCompanyCurrentPeriodAsync(string dataAreaId)
-        {
-            string calendarResponseMsg = await _periodService.GetCalendarForCompanyAsync(dataAreaId);
-            dynamic calendarResponseJson = JObject.Parse(calendarResponseMsg.ToString())["value"];
-            
-            if (calendarResponseJson.Count == 0)
+            try
             {
-                throw new Exception("Calendar not found for company provided");
-            }
-
-            string responseLedgerFP = await _service.GetLedgerFiscalPeriodsAsync(dataAreaId, calendarResponseJson[0].FiscalCalendar.ToString());
-            var combinedEntities = new List<JObject>();
-            var currentOpenPeriodJson = new JObject();
-            var responseJson = new JObject();
-            string currentOpenPeriod = "0000 00";
-            string minYear = "0000";
-
-            // Check if responseLedgerFP is null or empty, or NOT a valid json, or if ledgerFiscalPeriods is empty
-            if (string.IsNullOrEmpty(responseLedgerFP) || !JsonConversionExtensions.IsValidJson(responseLedgerFP) ||
-                    (JObject.Parse(responseLedgerFP)["value"] != null && !JObject.Parse(responseLedgerFP)["value"].Any()))
-            {
-                var noResultResponse = new JObject();
-                noResultResponse.Add("CurrentPeriod", currentOpenPeriod);
-                noResultResponse.Add("MinimumYear", minYear);
-                noResultResponse.Add("IsSuccessful", false);
-                return noResultResponse.ToString();
-            }
-
-            var ledgerFiscalPeriods = JObject.Parse(responseLedgerFP)["value"];
-
-            foreach (var ledgerFP in ledgerFiscalPeriods)
-            {
-                var responseFP = await _service.GetFiscalPeriodsAsync(ledgerFP["PeriodName"].ToString(), ledgerFP["Calendar"].ToString(), (int)ledgerFP["YearName"]);
-
-                //Add the property "StartDate" and "EndDate" to the JObject response...
-                if (!string.IsNullOrEmpty(responseFP))
+                //TODO: CleanUp
+                //Create Customer
+                var payloadCustomer = await _liquidTemplateService.GetLiquidTemplateAsync(customerInfo, LiquidTemplateConstants.CREATE_CUSTOMER_RECORD_TEMPLATE);
+                var responseCustomer = await _service.CreateCustomerAsync(payloadCustomer);
+                //Create PartyContact 
+                dynamic customer = JsonConvert.DeserializeObject<dynamic>(responseCustomer);
+                
+                if (string.IsNullOrEmpty(customer.PartyNumber?.ToString()))
                 {
-                    var combinedObject = new JObject();
-                    var responseFPJson = JObject.Parse(responseFP)["value"];
-
-                    if (responseFPJson != null && responseFPJson.Any())
-                    {
-                        // Add existing properties from ledgerFP
-                        combinedObject.Add("LedgerName", ledgerFP["LedgerName"]);
-                        combinedObject.Add("Calendar", ledgerFP["Calendar"]);
-                        combinedObject.Add("YearName", ledgerFP["YearName"]);
-                        combinedObject.Add("PeriodName", ledgerFP["PeriodName"]);
-                        combinedObject.Add("LegalEntityId", ledgerFP["LegalEntityId"]);
-
-                        // Add "StartDate" and "EndDate" from responseFP
-                        combinedObject.Add("StartDate", responseFPJson[0]["StartDate"]);
-                        combinedObject.Add("EndDate", responseFPJson[0]["EndDate"]);
-
-                        combinedEntities.Add(combinedObject);
-                    }
+                    throw new Exception("Could not retrieve Party(Account) Number");
                 }
-            }
+                if (string.IsNullOrEmpty(customer.dataAreaId?.ToString()))
+                {
+                    throw new Exception("Could not retrieve Company Code");
+                }
+                string dataAreaId = customer.dataAreaId?.ToString();
+                string partyNumber = customer.PartyNumber?.ToString();
+                var payloadPartyContact = await _liquidTemplateService.GetLiquidTemplateAsync(customerInfo, LiquidTemplateConstants.CREATE_PARTYCONTACT_RECORD_TEMPLATE);
+                dynamic partyContact = JsonConvert.DeserializeObject<dynamic>(payloadPartyContact);
+                foreach (dynamic item in partyContact.PartyContact)
+                {
+                    item.Add(new JProperty("PartyNumber", partyNumber));
+                    var ResponsePartyContact = await _service.CreatePartyContactsAsync(dataAreaId, partyNumber, item.ToString());
+                }
+                var responsePayload = await _liquidTemplateService.GetLiquidTemplateAsync(responseCustomer, LiquidTemplateConstants.CUSTOMER_CREATE_RESPONSE_TEMPLATE);
 
-            if (combinedEntities.Count() > 0)
-            {
-                currentOpenPeriodJson = combinedEntities.OrderByDescending(x => x["StartDate"]).FirstOrDefault();
-                DateTime period = Convert.ToDateTime(currentOpenPeriodJson["StartDate"]);
-                currentOpenPeriod = $"{period.Year} {period.ToString("MM")}"; //Format: "YYYY MM"
-                minYear = $"{period.Year}";
-
-                //Get Company Name
-                var responseCompany = await _service.GetCompanyAsync(dataAreaId);
-                var responseCompanyJson = JObject.Parse(responseCompany)["value"];
-                responseJson.Add("CompanyName", responseCompanyJson[0]["NameAlias"]);
-                responseJson.Add("CurrentPeriod", currentOpenPeriod);
-                responseJson.Add("MinimumYear", minYear);
+                return responsePayload;
             }
-            else
+            catch (Exception ex) 
             {
-                responseJson.Add("CurrentPeriod", currentOpenPeriod);
-                responseJson.Add("MinimumYear", minYear);
-                responseJson.Add("IsSuccessful", false);
+                throw new Exception(ex.Message);
             }
-            
-            return responseJson.ToString();
         }
 
-        public async Task<string> GetCompanyAsync(string legalEntityId)
+        public async Task<string> GetCustomerAsync(string companyId, string customerAccount)
         {
-            var response = await _service.GetCompanyAsync(legalEntityId);
-            var responsePayload = await _liquidTemplateService.GetLiquidTemplateAsync(response, LiquidTemplateConstants.RESPONSE_GET_COMPANY_RECORD_TEMPLATE);
-            return responsePayload.ToString();
+            try
+            {
+                var response = await _service.GetCustomerAsync(companyId, customerAccount);
+                var responsePayload = await _liquidTemplateService.GetLiquidTemplateAsync(response, LiquidTemplateConstants.RESPONSE_GET_CUSTOMER_RECORD_TEMPLATE);
+                return responsePayload.ToString();
+            }
+            catch (Exception ex)
+            {
+                throw new Exception(ex.Message);
+            }
+        }
+
+        public async Task<string> UpdateCustomerAsync(string customerInfo, string companyId, string customerAccount)
+        {
+            try
+            {
+                //Update customer record
+                var payloadCustomer = await _liquidTemplateService.GetLiquidTemplateAsync(customerInfo, LiquidTemplateConstants.UPDATE_CUSTOMER_RECORD_TEMPLATE);
+                var responseCustomer = await _service.UpdateCustomerAsync(payloadCustomer, companyId, customerAccount);
+
+                //Retrieve updated customer record
+                var responseGetCustomer = await _service.GetCustomerAsync(companyId, customerAccount);
+                var responseRetrieveCustomer = await _liquidTemplateService.GetLiquidTemplateAsync(responseGetCustomer, LiquidTemplateConstants.RESPONSE_GET_CUSTOMER_RECORD_TEMPLATE);
+                dynamic customer = JsonConvert.DeserializeObject<dynamic>(responseRetrieveCustomer);
+                if (string.IsNullOrEmpty(customer.PartyNumber?.ToString()))
+                {
+                    throw new Exception("Could not retrieve Party(Account) Number");
+                }
+
+                string partyNumber = customer.PartyNumber?.ToString();
+
+                //Retrieve existing PartyContact
+                var responseGetPartyContact = await _service.GetPartyContactsAsync(partyNumber);
+                JObject existingPartyContact = JsonConvert.DeserializeObject<JObject>(responseGetPartyContact);
+
+                //Update PartyContact
+                string payloadPartyContact = await _liquidTemplateService.GetLiquidTemplateAsync(customerInfo, LiquidTemplateConstants.UPDATE_PARTYCONTACT_RECORD_TEMPLATE);
+                dynamic partyContact = JsonConvert.DeserializeObject<dynamic>(payloadPartyContact);
+                
+
+                foreach (dynamic item in partyContact.PartyContact)
+                {
+                    dynamic payload = existingPartyContact["value"].Where(c => c["AVADBSPartyContactID"] == item.AVADBSPartyContactID).Select(c => c["ElectronicAddressId"]).FirstOrDefault();
+                    var ResponsePartyContact = await _service.UpdatePartyContactsAsync(partyNumber, payload?.ToString(), item.AVADBSPartyContactID?.ToString(), item?.ToString());
+                }
+
+                ////retrieve updated records
+                //var response = await _service.GetCustomerAsync(companyId, customerAccount);
+                
+                //var responsePayload = await _liquidTemplateService.GetLiquidTemplateAsync(response, LiquidTemplateConstants.RESPONSE_GET_CUSTOMER_RECORD_TEMPLATE);
+                return responseRetrieveCustomer.ToString();
+            }
+            catch (Exception ex)
+            {
+                throw new Exception(ex.Message, ex);
+            }
         }
     }
 }
