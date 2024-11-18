@@ -1,0 +1,240 @@
+using CAT.App.D365.Service.Core.Utilities.Interface;
+using CAT.App.D365.Service.Infra.Service;
+using Newtonsoft.Json.Linq;
+using Newtonsoft.Json;
+using CAT.App.D365.Service.Core.Utilities;
+using System.Text.RegularExpressions;
+using DotLiquid.Util;
+
+
+namespace CAT.App.D365.Service.Application.Service
+{
+    public class AccountApplication : IAccountApplication
+    {
+        private readonly IAccountService _service;       
+
+        public AccountApplication(IAccountService service)
+        {
+            _service = service;            
+        }
+        public async Task<string> ValidateAccountCodeAsync(string companyId, string accountCodesStr)
+        {
+            string responseMessage = string.Empty;
+            if (IsAccountCodeLengthValid(accountCodesStr, out responseMessage))
+            {
+                responseMessage = await ProcessAccountCodeValidationAsync(companyId, accountCodesStr);
+            }
+            return responseMessage;           
+        }
+        private async Task<string> ProcessAccountCodeValidationAsync(string companyId, string accountCodesStr)
+        {
+            bool isValid = false;
+
+            var accStructList = new List<Dictionary<string, object>>();
+            var accStructCriteriaList = new List<Dictionary<string, object>>();
+            string code = string.Empty, displayCode = string.Empty, infoCode = string.Empty, indexCode = string.Empty;
+
+            string[] accountCodes = accountCodesStr.Split(".");
+            
+            JArray segmentNamesInfoCodesArr = await GetSegmentNamesByAccountCodesAsync(accountCodesStr, accountCodes);
+
+            string[] accountStructureNames = await GetAccountStructuresFromLedgerAsync(companyId);
+
+            var accStructuresResponse = await _service.GetAccountStructuresAsync(accountStructureNames);
+            var accStructuresConstraintsResponse = await _service.GetAccountStructureConstraintsAsync(accountStructureNames);
+
+            if (JsonConversionExtensions.IsValidJson(accStructuresResponse) && JObject.Parse(accStructuresResponse)["value"] is JArray accStructuresArr &&
+                    JsonConversionExtensions.IsValidJson(accStructuresConstraintsResponse) && JObject.Parse(accStructuresConstraintsResponse)["value"] is JArray accConstraintsArray)
+            {
+                var aciveAccountStructures = accStructuresArr.Where(c => c.Values().Contains("Active"));
+                
+                foreach (var structure in aciveAccountStructures)
+                {
+                    foreach (var (acctCode, i) in accountCodes.Select((acctCode, i) => (acctCode, i)))
+                    {
+
+                        infoCode = acctCode.Substring(0, 4);
+                        displayCode = acctCode;
+                        code = acctCode.Replace(infoCode, "");
+                        indexCode = (i + 1).ToString();
+
+                        var dimensionName = segmentNamesInfoCodesArr.Where(b => b["AVADBSInfoCode"].Value<string>().Equals(infoCode)).Select(a => a["DimensionName"].Value<string>()).FirstOrDefault();
+                        var orderNum = structure.Children<JProperty>()
+                                        .Where(p => p.Name.StartsWith("SegmentName") && !string.IsNullOrEmpty(p.Value?.ToString()) && p.Value.ToString().Equals(dimensionName))
+                                        .Select(p => p.Name.ToString().Replace("SegmentName", "")).FirstOrDefault();
+
+                        isValid = ValidateCodeWithConstraint(isValid, code, accConstraintsArray, orderNum);
+                        if (!isValid)
+                        {
+                            break;
+                        }
+                    }
+
+                    if (isValid)
+                    {
+                        break;
+                    }
+
+                }
+
+            }
+
+            var response = new
+            {
+                ReturnSuccess = isValid.ToString(),
+                ReturnMessage = isValid ? "Account Code is valid" : $"Element {displayCode} is not valid at level {indexCode}."
+            };
+            return JsonConvert.SerializeObject(response);
+
+        }
+
+        private bool IsAccountCodeLengthValid(string accountCodesStr, out string message)
+        {
+            string[] accountCodes = accountCodesStr.Split(".");
+            message = string.Empty;
+            var invalidAccountCodes = accountCodes.Select((value, index) => new { value = value, index = index }).Where(c => c.value.Length < 4);
+            if (invalidAccountCodes.Any())
+            {
+                
+                var indexCode = string.Join(",", invalidAccountCodes.Select(item=>item.index));
+                var displayCode = string.Join(",", invalidAccountCodes.Select(item => item.value));
+                var invalidResponse = new
+                {
+                    ReturnSuccess = "False",
+                    ReturnMessage = $"Element {displayCode} is not valid at level {indexCode}."
+                };
+                message = JsonConvert.SerializeObject(invalidResponse);
+                return false;
+            }
+            return true;
+        }
+
+        private async Task<JArray> GetSegmentNamesByAccountCodesAsync(string accountCodesStr, string[] accountCodes)
+        {
+            var infoCodes = accountCodes.Select(x => x.Substring(0, 4)).ToArray();            
+            var segmentNamesResponse = await _service.GetSegmentNameAsync(infoCodes);
+
+            if (!JsonConversionExtensions.IsValidJson(segmentNamesResponse) || JObject.Parse(segmentNamesResponse)["value"] is not JArray segmentNamesInfoCodesArr)
+            {
+                throw new Exception($"DimensionAttributes did not return any values for Account Codes: {accountCodesStr}");
+            }
+            //Add MainAccount if not present
+            if (!segmentNamesInfoCodesArr.Where(b => b["AVADBSInfoCode"].Value<string>().Equals("GLNO")).Any())
+            {
+                segmentNamesInfoCodesArr.Add(new JObject(new JProperty("DimensionName", "MainAccount"), new JProperty("AVADBSInfoCode", "GLNO")));
+            }
+            return segmentNamesInfoCodesArr;
+        }
+
+        private async Task<string[]> GetAccountStructuresFromLedgerAsync(string companyId)
+        {
+            var resLedger = await _service.GetLedgersAsync(companyId);
+            if (!JsonConversionExtensions.IsValidJson(resLedger) ||
+              (JObject.Parse(resLedger)["value"] != null && !JObject.Parse(resLedger)["value"].Any()))
+            {
+                throw new Exception($"Ledgers did not return any values for CompanyID: {companyId}");
+            }
+            var ledgersJson = JObject.Parse(resLedger);
+
+
+            var accountStructureNames = ledgersJson["value"][0].Children<JProperty>()
+                .Where(p => p.Name.StartsWith("AccountStructureName") && !string.IsNullOrEmpty(p.Value?.ToString()))
+                .Select(p => p.Value.ToString()).ToArray();
+            return accountStructureNames;
+        }
+
+        private bool ValidateCodeWithConstraint(bool isValid, string code, JArray accConstraintsArray, string? orderNum)
+        {
+            foreach (var constraint in accConstraintsArray.Where(c => c.Values().Contains("Active")))
+            {
+                var segmentConstraint = constraint.Children<JProperty>()
+                    .Where(p => p.Name.Equals($"SegmentCriteria{orderNum}"))
+                    .Select(p => p.Value.ToString()).FirstOrDefault();
+                if (string.IsNullOrEmpty(segmentConstraint))
+                {
+                    isValid = false;
+                    break;
+                }
+                else
+                {
+                    isValid = ValidateCode(code, segmentConstraint);
+                }
+                if (isValid)
+                {
+                    break;
+                }
+            }
+
+            return isValid;
+        }
+
+        private bool ValidateCode(string code, string segmentCriteriaParam)
+        {
+            string isRegex = @"^[a-zA-Z0-9]*$";
+            string isLikeRegex = @"^\*[a-zA-Z0-9]*\*$";
+            string isBeginwithRegex = @"^[a-zA-Z0-9]*\S\*$";
+            string isEndWithRegex = @"^\*\S[a-zA-Z0-9]*$";  
+            string isGreaterRegex = @"^>[0-9]*$";
+            string isGreaterIncludeRegex = @"^[0-9]*\..\*$";
+            string isLessRegex = @"^<[0-9]*$";
+            string isLessIncludeRegex = @"^\*\.\.[0-9]*$";
+            string isBetweenRegex = @"^[0-9]*<\.\.<[0-9]*$";
+            string isBetweenIncludesRegex = @"^[0-9]*\.\.[0-9]*$";
+            
+            var segmentCriteria = segmentCriteriaParam.Replace("\"\";", "");
+
+            switch (true)
+            {
+                //check if segment criteria empty
+                case bool _ when (string.IsNullOrEmpty(segmentCriteriaParam)):
+                    return false;
+                //check if blank is allowed in segment criteria
+                case bool _ when (segmentCriteriaParam.Contains("\"\";") && string.IsNullOrEmpty(code)):
+                    return true;
+                //check if code is empty
+                case bool _ when string.IsNullOrEmpty(code):
+                    return false;
+                //check if segment criteria is * and code is not empty
+                case bool _ when segmentCriteria.Equals("*") && !string.IsNullOrEmpty(code):
+                    return true;                   
+                case bool _ when Regex.IsMatch(segmentCriteria, isRegex):
+                    return (segmentCriteria.Equals(code, StringComparison.CurrentCultureIgnoreCase));
+                case bool _ when Regex.IsMatch(segmentCriteria, isLikeRegex):
+                    return (segmentCriteria.Replace("*", "").Equals(code, StringComparison.CurrentCultureIgnoreCase));
+                case bool _ when Regex.IsMatch(segmentCriteria, isBeginwithRegex):
+                    return (code.StartsWith(segmentCriteria.Replace("*",""), StringComparison.InvariantCultureIgnoreCase));
+                case bool _ when Regex.IsMatch(segmentCriteria, isEndWithRegex):
+                    return (code.EndsWith(segmentCriteria.Replace("*", ""), StringComparison.InvariantCultureIgnoreCase));
+                case bool _ when Regex.IsMatch(segmentCriteria, isGreaterRegex):
+                    return (Convert.ToInt64(code) > Convert.ToInt64(segmentCriteria.Replace(">", "")) );
+                case bool _ when Regex.IsMatch(segmentCriteria, isGreaterIncludeRegex):
+                    {
+                        var criteria = segmentCriteria.Replace("..*", "");
+                        return (Convert.ToInt64(code) >= Convert.ToInt64(criteria));
+                    }                    
+                case bool _ when Regex.IsMatch(segmentCriteria, isLessRegex):
+                    return (Convert.ToInt64(code) < Convert.ToInt64(segmentCriteria.Replace("<", "")));
+                case bool _ when Regex.IsMatch(segmentCriteria, isLessIncludeRegex):
+                    {
+                        var criteria = segmentCriteria.Replace("*..", "");
+                        return (Convert.ToInt64(code) <= Convert.ToInt64(criteria));
+                    }                  
+                case bool _ when Regex.IsMatch(segmentCriteria, isBetweenRegex):
+                    {
+                        var criteria = segmentCriteria.Split("<..<");
+                        return (Convert.ToInt64(code) > Convert.ToInt64(criteria[0]) && Convert.ToInt64(code) < Convert.ToInt64(criteria[1]));
+                     }                   
+                case bool _ when Regex.IsMatch(segmentCriteria, isBetweenIncludesRegex):
+                    {
+                        var criteria = segmentCriteria.Split("..");
+                        return (Convert.ToInt64(code) >= Convert.ToInt64(criteria[0]) && Convert.ToInt64(code) <= Convert.ToInt64(criteria[1]));
+                     }             
+
+                default:
+                    return false;
+            }
+                   
+        }
+       
+    }
+}
